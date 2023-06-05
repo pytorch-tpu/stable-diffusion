@@ -8,7 +8,6 @@ natsort==8.3.1
 numpy==1.24.2
 omegaconf==2.3.0
 opencv_python==4.7.0.72
-packaging==20.3
 Pillow==9.4.0
 protobuf==3.20.3
 pudb==2022.1.3
