@@ -3,6 +3,7 @@
 import torch
 import numpy as np
 from tqdm import tqdm
+import torch_xla.core.xla_model as xm
 from functools import partial
 
 from ldm.modules.diffusionmodules.util import make_ddim_sampling_parameters, make_ddim_timesteps, noise_like
@@ -17,8 +18,10 @@ class PLMSSampler(object):
 
     def register_buffer(self, name, attr):
         if type(attr) == torch.Tensor:
-            if attr.device != torch.device("cuda"):
-                attr = attr.to(torch.device("cuda"))
+            # if attr.device != torch.device("cuda"):
+            #     attr = attr.to(torch.device("cuda"))
+            device = xm.xla_device()
+            attr = attr.to(torch.device(device))
         setattr(self, name, attr)
 
     def make_schedule(self, ddim_num_steps, ddim_discretize="uniform", ddim_eta=0., verbose=True):
@@ -136,10 +139,11 @@ class PLMSSampler(object):
         total_steps = timesteps if ddim_use_original_steps else timesteps.shape[0]
         print(f"Running PLMS Sampling with {total_steps} timesteps")
 
-        iterator = tqdm(time_range, desc='PLMS Sampler', total=total_steps)
+        # iterator = tqdm(time_range, desc='PLMS Sampler', total=total_steps)
         old_eps = []
 
-        for i, step in enumerate(iterator):
+        # for i, step in enumerate(iterator):
+        for i, step in enumerate(time_range):
             index = total_steps - i - 1
             ts = torch.full((b,), step, device=device, dtype=torch.long)
             ts_next = torch.full((b,), time_range[min(i + 1, len(time_range) - 1)], device=device, dtype=torch.long)
@@ -166,7 +170,7 @@ class PLMSSampler(object):
             if index % log_every_t == 0 or index == total_steps - 1:
                 intermediates['x_inter'].append(img)
                 intermediates['pred_x0'].append(pred_x0)
-
+            xm.mark_step()
         return img, intermediates
 
     @torch.no_grad()

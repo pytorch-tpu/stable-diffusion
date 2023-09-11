@@ -22,6 +22,11 @@ from ldm.models.diffusion.dpm_solver import DPMSolverSampler
 from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
 from transformers import AutoFeatureExtractor
 
+# import datetime
+# from time import time
+import torch_xla.core.xla_model as xm
+import torch_xla.debug.profiler as xp
+import torch_xla.debug.metrics as met
 
 # load safety model
 safety_model_id = "CompVis/stable-diffusion-safety-checker"
@@ -47,10 +52,10 @@ def numpy_to_pil(images):
 
 
 def load_model_from_config(config, ckpt, verbose=False):
-    print(f"Loading model from {ckpt}")
+    # print(f"Loading model from {ckpt}")
     pl_sd = torch.load(ckpt, map_location="cpu")
     if "global_step" in pl_sd:
-        print(f"Global Step: {pl_sd['global_step']}")
+        print(f'Global Step: {pl_sd["global_step"]}')
     sd = pl_sd["state_dict"]
     model = instantiate_from_config(config.model)
     m, u = model.load_state_dict(sd, strict=False)
@@ -61,7 +66,7 @@ def load_model_from_config(config, ckpt, verbose=False):
         print("unexpected keys:")
         print(u)
 
-    model.cuda()
+    # model.cuda()
     model.eval()
     return model
 
@@ -245,7 +250,8 @@ def main():
     config = OmegaConf.load(f"{opt.config}")
     model = load_model_from_config(config, f"{opt.ckpt}")
 
-    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    # device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    device = xm.xla_device()
     model = model.to(device)
 
     if opt.dpm_solver:
@@ -285,64 +291,68 @@ def main():
     if opt.fixed_code:
         start_code = torch.randn([opt.n_samples, opt.C, opt.H // opt.f, opt.W // opt.f], device=device)
 
-    precision_scope = autocast if opt.precision=="autocast" else nullcontext
+    # precision_scope = autocast if opt.precision=="autocast" else nullcontext
     with torch.no_grad():
-        with precision_scope("cuda"):
-            with model.ema_scope():
+        # with precision_scope("cuda"):
+        with model.ema_scope():
+
+            all_samples = list()
+            # for n in trange(opt.n_iter, desc="Sampling"):
+                # for prompts in tqdm(data, desc="data"):
+            for n in range(opt.n_iter):
                 tic = time.time()
-                all_samples = list()
-                for n in trange(opt.n_iter, desc="Sampling"):
-                    for prompts in tqdm(data, desc="data"):
-                        uc = None
-                        if opt.scale != 1.0:
-                            uc = model.get_learned_conditioning(batch_size * [""])
-                        if isinstance(prompts, tuple):
-                            prompts = list(prompts)
-                        c = model.get_learned_conditioning(prompts)
-                        shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
-                        samples_ddim, _ = sampler.sample(S=opt.ddim_steps,
-                                                         conditioning=c,
-                                                         batch_size=opt.n_samples,
-                                                         shape=shape,
-                                                         verbose=False,
-                                                         unconditional_guidance_scale=opt.scale,
-                                                         unconditional_conditioning=uc,
-                                                         eta=opt.ddim_eta,
-                                                         x_T=start_code)
+                for prompts in data:
+                    uc = None
+                    if opt.scale != 1.0:
+                        uc = model.get_learned_conditioning(batch_size * [""])
+                    if isinstance(prompts, tuple):
+                        prompts = list(prompts)
+                    c = model.get_learned_conditioning(prompts)
+                    shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
+                    samples_ddim, _ = sampler.sample(S=opt.ddim_steps,
+                                                      conditioning=c,
+                                                      batch_size=opt.n_samples,
+                                                      shape=shape,
+                                                      verbose=False,
+                                                      unconditional_guidance_scale=opt.scale,
+                                                      unconditional_conditioning=uc,
+                                                      eta=opt.ddim_eta,
+                                                      x_T=start_code)
 
-                        x_samples_ddim = model.decode_first_stage(samples_ddim)
-                        x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
-                        x_samples_ddim = x_samples_ddim.cpu().permute(0, 2, 3, 1).numpy()
+                    x_samples_ddim = model.decode_first_stage(samples_ddim)
+                    x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
+                    x_samples_ddim = x_samples_ddim.cpu().permute(0, 2, 3, 1).numpy()
 
-                        x_checked_image, has_nsfw_concept = check_safety(x_samples_ddim)
+                    x_checked_image, has_nsfw_concept = check_safety(x_samples_ddim)
 
-                        x_checked_image_torch = torch.from_numpy(x_checked_image).permute(0, 3, 1, 2)
+                    x_checked_image_torch = torch.from_numpy(x_checked_image).permute(0, 3, 1, 2)
+                    toc = time.time()
+                    print('tic-toc', toc-tic)
+                    # if not opt.skip_save:
+                    #     for x_sample in x_checked_image_torch:
+                    #         x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
+                    #         img = Image.fromarray(x_sample.astype(np.uint8))
+                    #         img = put_watermark(img, wm_encoder)
+                    #         # img.save(os.path.join(sample_path, f"{base_count:05}.png"))
+                    #         base_count += 1
 
-                        if not opt.skip_save:
-                            for x_sample in x_checked_image_torch:
-                                x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
-                                img = Image.fromarray(x_sample.astype(np.uint8))
-                                img = put_watermark(img, wm_encoder)
-                                img.save(os.path.join(sample_path, f"{base_count:05}.png"))
-                                base_count += 1
+                    # if not opt.skip_grid:
+                    #     all_samples.append(x_checked_image_torch)
 
-                        if not opt.skip_grid:
-                            all_samples.append(x_checked_image_torch)
+            # if not opt.skip_grid:
+            #     # additionally, save as grid
+            #     grid = torch.stack(all_samples, 0)
+            #     grid = rearrange(grid, 'n b c h w -> (n b) c h w')
+            #     grid = make_grid(grid, nrow=n_rows)
 
-                if not opt.skip_grid:
-                    # additionally, save as grid
-                    grid = torch.stack(all_samples, 0)
-                    grid = rearrange(grid, 'n b c h w -> (n b) c h w')
-                    grid = make_grid(grid, nrow=n_rows)
+            #     # to image
+            #     grid = 255. * rearrange(grid, 'c h w -> h w c').cpu().numpy()
+            #     img = Image.fromarray(grid.astype(np.uint8))
+            #     img = put_watermark(img, wm_encoder)
+            #     # img.save(os.path.join(outpath, f'grid-{grid_count:04}.png'))
+            #     grid_count += 1
 
-                    # to image
-                    grid = 255. * rearrange(grid, 'c h w -> h w c').cpu().numpy()
-                    img = Image.fromarray(grid.astype(np.uint8))
-                    img = put_watermark(img, wm_encoder)
-                    img.save(os.path.join(outpath, f'grid-{grid_count:04}.png'))
-                    grid_count += 1
 
-                toc = time.time()
 
     print(f"Your samples are ready and waiting for you here: \n{outpath} \n"
           f" \nEnjoy.")

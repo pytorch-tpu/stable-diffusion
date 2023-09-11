@@ -140,7 +140,9 @@ class FrozenCLIPEmbedder(AbstractEncoder):
         super().__init__()
         self.tokenizer = CLIPTokenizer.from_pretrained(version)
         self.transformer = CLIPTextModel.from_pretrained(version)
-        self.device = device
+        import torch_xla.core.xla_model as xm
+        self.device = xm.xla_device()
+        # self.device = device
         self.max_length = max_length
         self.freeze()
 
